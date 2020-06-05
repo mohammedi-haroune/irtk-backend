@@ -1,5 +1,5 @@
 nltk==3.3
 six==1.11.0
-Django==2.1.11
+Django==2.2.13
 djangorestframework==3.9.0
 django-cors-headers==2.4.0
