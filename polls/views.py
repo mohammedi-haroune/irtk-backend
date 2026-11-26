@@ -3,8 +3,12 @@ from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
 from django.urls import reverse
 from django.views import generic
-from nltk.corpus import *
+import nltk.corpus
+import nltk.data
+from django.conf import settings
+from nltk.corpus.reader import PlaintextCorpusReader
 from rest_framework import status
+from rest_framework.exceptions import NotFound
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import JSONParser, MultiPartParser
 from rest_framework.response import Response
@@ -15,7 +19,18 @@ from polls.models import Document, VectorModelResult
 from polls.serializers import DocumentSerializer, VectorModelResultSerializer, FindResultSerializer, CorporaSerializer
 from .models import Choice, Question
 
-CORPORAS_ROOT = 'corporas/'
+CORPORAS_ROOT = os.path.join(settings.BASE_DIR, 'corporas')
+
+# nltk 3.9+ only reads corpora under nltk.data.path, so allow the uploads folder
+nltk.data.path.append(CORPORAS_ROOT)
+
+# NLTK corpora offered next to the uploaded ones. Each needs its data first:
+# python -m nltk.downloader brown
+NLTK_CORPORA = ['brown']
+
+# IRModels objects, one per corpus name. The session only stores the name,
+# because Django 5 sessions are JSON and can't hold Python objects.
+_IR_MODELS = {}
 
 
 class IndexView(generic.ListView):
@@ -62,12 +77,62 @@ def DocumentResponse(fileids):
     return Response(serializer.data)
 
 
-def corpus(request):
-    return request.session['IR_MODELS']._corpus
+def is_valid_corpus_name(name):
+    return bool(name) and '/' not in name and '\\' not in name and not name.startswith('.')
+
+
+def load_corpus(corpus_name):
+    """Return the corpus reader for an uploaded corpus or an NLTK corpus, or None."""
+    if not is_valid_corpus_name(corpus_name):
+        return None
+    path = os.path.join(CORPORAS_ROOT, corpus_name)
+    if os.path.isdir(path):
+        return PlaintextCorpusReader(path, r'.*\.txt')
+    if corpus_name in NLTK_CORPORA:
+        corpus = getattr(nltk.corpus, corpus_name)
+        try:
+            corpus.ensure_loaded()
+        except LookupError:
+            return None
+        return corpus
+    return None
 
 
 def models(request):
-    return request.session['IR_MODELS']
+    corpus_name = request.session.get('CORPUS_NAME')
+    if corpus_name is None:
+        raise NotFound('No corpus selected')
+    if corpus_name not in _IR_MODELS:
+        corpus = load_corpus(corpus_name)
+        if corpus is None:
+            raise NotFound('Corpus not found: ' + corpus_name)
+        _IR_MODELS[corpus_name] = IRModels(corpus)
+    return _IR_MODELS[corpus_name]
+
+
+def corpus(request):
+    return models(request)._corpus
+
+
+def describe_corpus(name, c):
+    o = {'name': name}
+
+    try:
+        o['description'] = c.readme()
+    except Exception:
+        o['description'] = 'No README file found'
+
+    try:
+        o['files'] = c.fileids()
+    except Exception:
+        pass
+
+    try:
+        o['categories'] = c.categories()
+    except Exception:
+        pass
+
+    return o
 
 
 @api_view(['GET'])
@@ -86,9 +151,10 @@ def fileids(request):
 @api_view(['GET'])
 def boolean_model(request):
     query = request.query_params.get('query')
+    ir = models(request)
     try:
-        docs = models(request).all_match(query)
-    except:
+        docs = ir.all_match(query)
+    except Exception:
         return Response(status=status.HTTP_400_BAD_REQUEST)
 
     return DocumentResponse(docs)
@@ -96,13 +162,14 @@ def boolean_model(request):
 
 @api_view(['GET'])
 def vector_model(request):
-    query = request.query_params.get('query')
+    query = request.query_params.get('query') or ''
+    ir = models(request)
     results = [VectorModelResult(fileid,
-                                 models(request).inner_product(query, fileid),
-                                 models(request).dice_coef(query, fileid),
-                                 models(request).cosinus_measure(query, fileid),
-                                 models(request).jaccard_coef(query, fileid))
-               for fileid in corpus(request).fileids()]
+                                 ir.inner_product(query, fileid),
+                                 ir.dice_coef(query, fileid),
+                                 ir.cosinus_measure(query, fileid),
+                                 ir.jaccard_coef(query, fileid))
+               for fileid in ir._corpus.fileids()]
 
     serializer = VectorModelResultSerializer(results, many=True)
     return Response(serializer.data)
@@ -120,142 +187,65 @@ def find(request):
 @api_view(['POST'])
 @parser_classes((MultiPartParser, JSONParser))
 def handle_file(request):
-    corpus_name = request.POST['CORPUS_NAME']
-    description = request.POST['CORPUS_DESCRIPTION']
+    corpus_name = request.data.get('CORPUS_NAME', '')
+    description = request.data.get('CORPUS_DESCRIPTION', '')
+    if not is_valid_corpus_name(corpus_name):
+        return Response(status=status.HTTP_400_BAD_REQUEST)
 
     file = request.data['file']
-    corpus_path = CORPORAS_ROOT + corpus_name + '/'
-    if not os.path.exists(corpus_path):
-        os.makedirs(corpus_path)
-    with open(corpus_path + file.name, 'wb+') as destination:
+    corpus_path = os.path.join(CORPORAS_ROOT, corpus_name)
+    os.makedirs(corpus_path, exist_ok=True)
+    with open(os.path.join(corpus_path, os.path.basename(file.name)), 'wb+') as destination:
         for chunk in file.chunks():
             destination.write(chunk)
 
-    readme_path = corpus_path + 'README'
+    readme_path = os.path.join(corpus_path, 'README')
     if not os.path.exists(readme_path):
         with open(readme_path, 'w') as readme:
             readme.write(description)
+
+    # the corpus changed, so its models must be rebuilt on next use
+    _IR_MODELS.pop(corpus_name, None)
 
     return Response(status=status.HTTP_202_ACCEPTED)
 
 
 @api_view(['POST'])
 def select_corpus(request):
-    corpus_name = request.POST['CORPUS_NAME']
+    corpus_name = request.data.get('CORPUS_NAME')
+    corpus = load_corpus(corpus_name)
+    if corpus is None:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    if corpus_name not in _IR_MODELS:
+        _IR_MODELS[corpus_name] = IRModels(corpus)
     request.session['CORPUS_NAME'] = corpus_name
-
-    if os.path.exists(CORPORAS_ROOT + corpus_name):
-        corpus = PlaintextCorpusReader(CORPORAS_ROOT + corpus_name, '.*\.txt')
-    else:
-        try:
-            corpus = eval('nltk.corpus.' + corpus_name)
-        except:
-            return Response(status=status.HTTP_400_BAD_REQUEST)
-
-    ir = IRModels(corpus)
-    request.session['IR_MODELS'] = ir
 
     return Response(status=status.HTTP_202_ACCEPTED)
 
+
 @api_view(['GET'])
 def selected_corpus(request):
-    print(request.session.keys())
-    print(request.session.session_key)
-
-    if request.session.session_key is None:
-        return Response(status=status.HTTP_404_NOT_FOUND)
-
     c = corpus(request)
-
-    o = {'name': request.session['CORPUS_NAME']}
-
-    try:
-        o['description'] = c.readme()
-    except:
-        o['description'] = 'No README file found'
-
-    try:
-        o['files'] = c.fileids()
-    except:
-        pass
-
-    try:
-        o['categories'] = c.categories()
-    except:
-        pass
-
-    serializer = CorporaSerializer(o)
+    serializer = CorporaSerializer(describe_corpus(request.session['CORPUS_NAME'], c))
     return Response(serializer.data)
 
 
 @api_view(['GET'])
 def corporas(request):
-    # get nltk corporas
-    # names = os.listdir(nltk.data.find("corpora"))
-    names = ['brown']
     objects = []
-    for name in names:
-        try:
-            c = eval(name)
-        except:
-            continue
 
-        o = {'name': name}
+    # NLTK corpora whose data is downloaded
+    for name in NLTK_CORPORA:
+        c = load_corpus(name)
+        if c is not None:
+            objects.append(describe_corpus(name, c))
 
-        try:
-            o['description'] = c.readme()
-        except:
-            o['description'] = 'No README file found'
-
-        # try:
-        #    o['words'] = len(c.words())
-        # except:
-        #    pass
-
-        try:
-            o['files'] = c.fileids()
-        except:
-            pass
-
-        try:
-            o['categories'] = c.categories()
-        except:
-            pass
-
-        objects.append(o)
-
-    # get user defined corporas
-    defined_names = os.listdir(CORPORAS_ROOT)
-
-    for name in defined_names:
-        try:
-            c = PlaintextCorpusReader(CORPORAS_ROOT + name, '.*\.txt')
-        except:
-            continue
-
-        o = {'name': name}
-
-        try:
-            o['description'] = c.readme()
-        except:
-            o['description'] = 'No README file found'
-
-        # try:
-        #    o['words'] = len(c.words())
-        # except:
-        #    pass
-
-        try:
-            o['files'] = c.fileids()
-        except:
-            pass
-
-        try:
-            o['categories'] = c.categories()
-        except:
-            pass
-
-        objects.append(o)
+    # user defined corporas
+    for name in sorted(os.listdir(CORPORAS_ROOT)):
+        c = load_corpus(name)
+        if c is not None:
+            objects.append(describe_corpus(name, c))
 
     serializer = CorporaSerializer(objects, many=True)
     return Response(serializer.data)

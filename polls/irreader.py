@@ -6,7 +6,6 @@ import re
 
 from nltk.corpus.reader import PlaintextCorpusReader
 from nltk.stem import SnowballStemmer
-from six import string_types
 from nltk.tokenize import *
 from nltk.corpus.reader.util import *
 from nltk.corpus.reader.api import *
@@ -24,6 +23,7 @@ class IRModels:
         self._corpus = corpus
         self._freq = nltk.ConditionalFreqDist(
             [(fileid, token) for fileid in self._corpus.fileids() for token in self._corpus.words(fileid)])
+        self._idf = {}
 
     # def __init__(self, root, lang,
     #              fileids='.*\.txt',
@@ -53,52 +53,52 @@ class IRModels:
         return word
 
 
+    def _counts(self, fileid=None, terms=None):
+        """
+        :return the term counts of the given fileid, or of the given list of terms
+        """
+        if fileid is not None:
+            return self._freq[fileid]
+        elif terms is not None and len(terms):
+            return nltk.FreqDist(terms)
+        else:
+            raise ValueError('tf method should be called either with fileid or terms params')
+
     def tf(self, term, fileid=None, terms=None):
         """
         override the tf method using the formula freq(term) / max(freq(t) for t in text)
         instead of the default one: freq(term) / len(text)
         """
-        if fileid is not None:
-            text = self._corpus.words(fileid)
-        elif len(terms):
-            text = terms
-        else:
-            raise ValueError('tf method should be called either with fileid or terms params')
-
-        term = self.stem(term)
-        print('fileid', fileid)
-        print('tf', float(text.count(term)) / max([float(text.count(t)) for t in text]))
-        return float(text.count(term)) / max([float(text.count(t)) for t in text])
+        counts = self._counts(fileid, terms)
+        if not counts:
+            return 0.0
+        return float(counts[self.stem(term)]) / max(counts.values())
 
     def idf(self, term):
         """
         override the idf method by ensuring that term is in it's stemmed form
         """
         term = self.stem(term)
-        N = len(self._corpus.fileids())
-        ni = len([True for file in self._corpus.fileids() if self.freq(file, term)])
+        if term not in self._idf:
+            N = len(self._corpus.fileids())
+            ni = len([True for file in self._corpus.fileids() if self.freq(file, term)])
 
-        if ni == 0: q = 0
-        else: q = N / ni
+            if ni == 0: q = 0
+            else: q = N / ni
 
-        return log(q + 1)
+            self._idf[term] = log(q + 1)
+        return self._idf[term]
 
     def tf_idf(self, term=None, fileid=None, terms=None):
         """
         :return the tf_idf value for all words of the given fileid if term is None,
          otherwise the tf_idf score for the give term
         """
-        if fileid is not None:
-            text = self._corpus.words(fileid)
-        elif len(terms):
-            text = terms
-        else:
-            raise ValueError('tf method should be called either with fileid or terms params')
-
         if term is None:
-            return {self.stem(term): self.tf(term, terms=text) * self.idf(term) for term in text}
+            counts = self._counts(fileid, terms)
+            return {self.stem(t): self.tf(t, fileid, terms) * self.idf(t) for t in counts}
         else:
-            return self.tf(term, terms=text) * self.idf(term)
+            return self.tf(term, fileid, terms) * self.idf(term)
 
     def freq(self, fileid, term=None):
         """
@@ -123,7 +123,7 @@ class IRModels:
         """
         Apply boolean model for the given query and the given fileid
         :param query boolean query with operations (and, or, not). example: web and (pdf or video)
-        :raise
+        :raise ValueError if the query is not a valid boolean expression
         """
 
         def replace(word):
@@ -131,21 +131,22 @@ class IRModels:
             if word in ['and', 'or', 'not']:
                 return word
             else:
-                return str(self.stem(word) in self._corpus.words(fileid))
+                return str(self.freq(fileid, word) > 0)
 
-        query = re.sub(r'\w+', replace, query)
-        print('evaluating', query, 'for', fileid)
-        return eval(query)
+        expression = re.sub(r'\w+', replace, query)
+        # only True, False, and, or, not and parentheses may reach eval
+        if re.sub(r'True|False|and|or|not|[()\s]', '', expression):
+            raise ValueError('invalid boolean query: ' + query)
+        return eval(expression, {'__builtins__': {}}, {})
 
     def all_match(self, query):
         """
         :return all the documents that matches the given boolean query
         """
-        print('all_match', query)
         return [file for file in self._corpus.fileids() if self.match(query, file)]
 
     def inner_product(self, query, fileid):
-        """
+        r"""
         :return the inner product (query \intersect fileid)
         :rtype(double)
         """
@@ -154,7 +155,7 @@ class IRModels:
         return round(r, 2)
 
     def dice_coef(self, query, fileid):
-        """
+        r"""
         :return the dice coef ((2 * |query \intersect fileid|) \ (|query| + |fileid|))
         """
         terms = [self.stem(t) for t in self._corpus._word_tokenizer.tokenize(query)]
@@ -166,7 +167,7 @@ class IRModels:
         return round(r, 2)
 
     def cosinus_measure(self, query, fileid):
-        """
+        r"""
         :return the cosinus measure ((|query \intersect fileid|) \ (sqrt(|query|) + sqrt(|fileid|))
         """
         terms = [self.stem(t) for t in self._corpus._word_tokenizer.tokenize(query)]
@@ -178,7 +179,7 @@ class IRModels:
         return round(r, 2)
 
     def jaccard_coef(self, query, fileid):
-        """
+        r"""
         :return the jaccard coef ((|query \intersect fileid|) \ (|query| + |fileid| - (|query \intersect fileid|)))
         """
         terms = [self.stem(t) for t in self._corpus._word_tokenizer.tokenize(query)]

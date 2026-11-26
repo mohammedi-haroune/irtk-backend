@@ -113,8 +113,6 @@ TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
-USE_L10N = True
-
 USE_TZ = True
 
 
@@ -123,7 +121,8 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 
-#CROS
+# CORS: the Vue dev server proxies /polls/ to this server, so CORS is only
+# needed when the frontend calls the API directly from another origin.
 CORS_ALLOW_METHODS = (
     'DELETE',
     'GET',
@@ -134,8 +133,10 @@ CORS_ALLOW_METHODS = (
 )
 
 CORS_ALLOW_CREDENTIALS = True
-CORS_ORIGIN_ALLOW_ALL = False
-CORS_ORIGIN_WHITELIST = ('127.0.0.1:8080')
+CORS_ALLOWED_ORIGINS = [
+    'http://127.0.0.1:5173',
+    'http://localhost:5173',
+]
 CORS_ALLOW_HEADERS = (
     'accept',
     'accept-encoding',
@@ -150,5 +151,4 @@ CORS_ALLOW_HEADERS = (
     'corpus-name'
 )
 
-SESSION_SERIALIZER='django.contrib.sessions.serializers.PickleSerializer'
-SESSION_COOKIE_DOMAIN=''
+DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
