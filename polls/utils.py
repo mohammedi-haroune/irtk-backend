@@ -15,10 +15,8 @@ def normalize(lang, stem=True, lower=True):
             if term is not None:
                 if lower:
                     term = term.lower()
-                    print(term)
                 if stem:
                     term = _word_stemmer.stem(term.lower())
-                    print(term)
 
             return func(term, *args, **kwargs)
 
